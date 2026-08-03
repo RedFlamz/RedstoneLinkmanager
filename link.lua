@@ -24,9 +24,14 @@ assert(bridge, "No redstone_link_bridge found")
                              or bundle member (Toggle or Status).
                    Output  - control bound to a writable link (an
                              Output-mode single link, or a bundle's
-                             Toggle). Tapping it toggles 0/15. You can
-                             give it a value->text map so instead of
-                             "Out: 15" it shows e.g. "Open".
+                             Toggle). Tapping it toggles 0/15. Press
+                             Enter to give its 0/15 values their own
+                             text (e.g. OFF/ON, CLOSED/OPEN) instead of
+                             raw numbers, and to set custom colors.
+                 Input blocks can also be given custom value text (their
+                 bound Status/link is often binary too), and every block
+                 type (Text/Input/Output) can have its background and
+                 text color customized independently via its editor.
 
   LIST VIEW CONTROLS
     Arrow Up/Down   Move selection             Mouse click   Select / buttons
@@ -53,6 +58,11 @@ assert(bridge, "No redstone_link_bridge found")
     Enter           Edit selected block         Tab           Select next block
     Space           Tap selected block          V             Switch to List view
     Q               Quit (auto-saves)
+
+    Editing a block (Enter / right-click) also lets you set its value
+    text (Quick: just 0 and 15, e.g. ON/OFF; Advanced: any of the 16
+    signal strengths; or Clear to show raw numbers) and its background
+    and text colors, independent of the block's type default.
 
     NOTE ON KEY REPEATS: Minecraft resends "key" events continuously while
     a key stays physically held down. Discrete actions ignore those
@@ -102,6 +112,43 @@ local DEFAULT_TEXT_W, DEFAULT_TEXT_H = 12, 1
 local DEFAULT_WIDGET_W, DEFAULT_WIDGET_H = 14, 3
 
 -- ======================================================================
+-- CONSTANTS: color palette for customizable block colors
+-- Defined this early (before persistence/rendering code) so every
+-- function that needs it - including loadData, far below - already has
+-- it in lexical scope regardless of where in the file it's written.
+-- ======================================================================
+local COLOR_PALETTE = {
+  { name = "Use Default", value = "__default__" },
+  { name = "White",       value = colors.white },
+  { name = "Orange",      value = colors.orange },
+  { name = "Magenta",     value = colors.magenta },
+  { name = "Light Blue",  value = colors.lightBlue },
+  { name = "Yellow",      value = colors.yellow },
+  { name = "Lime",        value = colors.lime },
+  { name = "Pink",        value = colors.pink },
+  { name = "Gray",        value = colors.gray },
+  { name = "Light Gray",  value = colors.lightGray },
+  { name = "Cyan",        value = colors.cyan },
+  { name = "Purple",      value = colors.purple },
+  { name = "Blue",        value = colors.blue },
+  { name = "Brown",       value = colors.brown },
+  { name = "Green",       value = colors.green },
+  { name = "Red",         value = colors.red },
+  { name = "Black",       value = colors.black },
+}
+
+local VALID_COLOR_VALUES = {}
+for _, entry in ipairs(COLOR_PALETTE) do
+  if type(entry.value) == "number" then VALID_COLOR_VALUES[entry.value] = true end
+end
+
+-- Guards against a corrupted/hand-edited save file supplying a bogus
+-- color number, which would otherwise error out of term.setBackgroundColor.
+local function isValidColorValue(v)
+  return type(v) == "number" and VALID_COLOR_VALUES[v] == true
+end
+
+-- ======================================================================
 -- BRIDGE CONNECTION STATE
 -- ======================================================================
 local bridgeConn = {
@@ -140,8 +187,15 @@ local selected           = 0   -- index into displayRows (0 = none)
 local scrollOffset       = 0
 
 local appMode           = "list"  -- "list" or "canvas"
-local canvasBlocks      = {}      -- { {type=,x=,y=,w=,h=,text=,label=,
-                                   --    linkId=,memberKey=,labels={}}, ... }
+local canvasBlocks      = {}
+--[[
+  Canvas block:
+    { type=BLOCK_TEXT/BLOCK_INPUT/BLOCK_OUTPUT, x=, y=, w=, h=,
+      text=, label=, linkId=, memberKey=, labels={ [0]="...", [15]="..." },
+      bgColor=colorNum or nil, fgColor=colorNum or nil }
+  bgColor/fgColor of nil means "use this block type's default color".
+  labels maps a raw signal value (0-15) to custom display text.
+]]
 local selectedBlockIndex = 0
 local dragState           = nil    -- {mode="move"/"resize", blockIndex=, ...}
 local isShiftDown         = false
@@ -177,14 +231,14 @@ local markDirty, redraw, refreshAfterDialog, setStatus
 local readLineInput, choiceDialog, promptSingleField, promptTwoFields
 local promptEntryKind, promptLinkMode, promptNameAndFreqs
 local singleLinkFullEditFlow, bundleFullEditFlow, confirmDialog
-local pickLinkDialog, labelsEditorDialog
+local pickLinkDialog, labelsEditorDialog, colorPickerDialog, promptOnOffLabels
 local applyOutput, getTogglablePollable, toggleBundleExpanded
 local findLinkEntryById, resolveBlockSource, getBlockDisplayName, buildCandidates, findBlockAt
 local actionAdd, actionDelete, actionRename, actionEditFrequencies
 local actionEditFull, actionDuplicate
 local actionToggleOutput, actionIncOutput, actionDecOutput
 local actionFilter, sortLinksAlpha
-local actionAddBlock, actionEditBlock, actionDeleteBlock, actionTapBlock
+local actionAddBlock, actionEditBlock, actionDeleteBlock, actionTapBlock, promptBlockColors
 local selectNextBlock, clampAllBlocksToScreen
 local handleKey, handleChar, handleMouseClick, handleMouseScroll
 local handleCanvasKey, handleCanvasMouseClick, handleCanvasMouseDrag
@@ -321,6 +375,8 @@ saveData = function()
       text = block.text, label = block.label,
       linkId = block.linkId, memberKey = block.memberKey,
       labels = block.labels,
+      bgColor = block.bgColor,
+      fgColor = block.fgColor,
     }
   end
 
@@ -439,6 +495,8 @@ loadData = function()
         linkId = tonumber(item.linkId),
         memberKey = (item.memberKey == "toggle" or item.memberKey == "status") and item.memberKey or nil,
         labels = {},
+        bgColor = nil,
+        fgColor = nil,
       }
       if type(item.labels) == "table" then
         for k, v in pairs(item.labels) do
@@ -446,6 +504,11 @@ loadData = function()
           if nk and v ~= nil then block.labels[nk] = tostring(v) end
         end
       end
+
+      local bgVal = tonumber(item.bgColor)
+      if isValidColorValue(bgVal) then block.bgColor = bgVal end
+      local fgVal = tonumber(item.fgColor)
+      if isValidColorValue(fgVal) then block.fgColor = fgVal end
 
       local minW = (block.type == BLOCK_TEXT) and MIN_TEXT_W or MIN_WIDGET_W
       local minH = (block.type == BLOCK_TEXT) and MIN_TEXT_H or MIN_WIDGET_H
@@ -833,6 +896,19 @@ local function wrapText(text, width, maxLines)
   return lines
 end
 
+-- Default colors used when a block's bgColor/fgColor is nil (i.e. the
+-- user hasn't customized that block, or picked "Use Default").
+local function defaultBgForBlockType(t)
+  if t == BLOCK_TEXT then return colors.gray
+  elseif t == BLOCK_INPUT then return colors.blue
+  else return colors.brown end
+end
+
+local function defaultFgForBlockType(t)
+  if t == BLOCK_TEXT then return colors.black
+  else return colors.white end
+end
+
 drawBlock = function(block, isSelected)
   local x1 = clamp(block.x, 1, W)
   local y1 = clamp(block.y, LIST_TOP, LIST_BOTTOM)
@@ -840,17 +916,12 @@ drawBlock = function(block, isSelected)
   local y2 = clamp(block.y + block.h - 1, LIST_TOP, LIST_BOTTOM)
   if x2 < x1 or y2 < y1 then return end -- fully off-screen, nothing to draw
 
-  local bg, fg
-  if block.type == BLOCK_TEXT then
-    bg = isSelected and colors.lightGray or colors.gray
-    fg = colors.black
-  elseif block.type == BLOCK_INPUT then
-    bg = isSelected and colors.lightBlue or colors.blue
-    fg = colors.white
-  else
-    bg = isSelected and colors.orange or colors.brown
-    fg = colors.white
-  end
+  -- Effective colors: the block's own customization, or its type default.
+  -- Selection is deliberately NOT expressed by changing these - it's shown
+  -- via the name/text turning yellow and the resize handle below, so a
+  -- block's chosen colors always render exactly as configured.
+  local bg = block.bgColor or defaultBgForBlockType(block.type)
+  local fg = block.fgColor or defaultFgForBlockType(block.type)
 
   for y = y1, y2 do
     term.setCursorPos(x1, y)
@@ -863,12 +934,14 @@ drawBlock = function(block, isSelected)
     local lines = wrapText(block.text, w, y2 - y1 + 1)
     for i, line in ipairs(lines) do
       term.setCursorPos(x1, y1 + i - 1)
-      term.setBackgroundColor(bg); term.setTextColor(fg)
+      term.setBackgroundColor(bg)
+      term.setTextColor(isSelected and colors.yellow or fg)
       term.write(line)
     end
   else
     term.setCursorPos(x1, y1)
-    term.setBackgroundColor(bg); term.setTextColor(fg)
+    term.setBackgroundColor(bg)
+    term.setTextColor(isSelected and colors.yellow or fg)
     local name = getBlockDisplayName(block)
     if #name > w then name = name:sub(1, math.max(1, w - 1)) .. "~" end
     term.write(name)
@@ -885,7 +958,8 @@ drawBlock = function(block, isSelected)
         local raw = canWrite and (pollable.output or 0) or (pollable.input or 0)
         local labelStr = block.labels and block.labels[raw]
         valueText = labelStr or ((canWrite and "Out: " or "In: ") .. tostring(raw))
-        term.setTextColor(raw > 0 and colors.yellow or fg)
+        local activeColor = canWrite and colors.orange or colors.lime
+        term.setTextColor(raw > 0 and activeColor or fg)
       end
       if #valueText > w then valueText = valueText:sub(1, math.max(1, w - 1)) .. "~" end
       term.write(valueText .. string.rep(" ", math.max(0, w - #valueText)))
@@ -902,6 +976,8 @@ drawBlock = function(block, isSelected)
   end
 
   -- Resize handle: only shown on the selected block, bottom-right corner.
+  -- Always a fixed yellow/black so it stays visible regardless of the
+  -- block's own chosen colors.
   if isSelected then
     term.setCursorPos(x2, y2)
     term.setBackgroundColor(colors.yellow)
@@ -1504,9 +1580,9 @@ pickLinkDialog = function(title, candidates, initialIndex)
   return result
 end
 
--- Editor for an Output block's value->text map (values 0-15). Backspace
--- clears the highlighted value's label; Enter opens a text prompt for it.
--- Returns the updated labels table (edits are committed as you go).
+-- Editor for a block's value->text map across all 16 signal strengths
+-- (0-15). Backspace clears the highlighted value's label; Enter opens a
+-- text prompt for it. Returns the updated labels table.
 labelsEditorDialog = function(existing)
   suspendRender = true
   local function run()
@@ -1586,6 +1662,127 @@ labelsEditorDialog = function(existing)
         end
       elseif ev == "mouse_scroll" then
         sel = clamp(sel + a, 1, 16); ensureVis(); render()
+      end
+    end
+  end
+  local ok, result = pcall(run)
+  suspendRender = false
+  if not ok then error(result, 0) end
+  return result
+end
+
+-- Quick shortcut for the common case: label just the 0 and 15 values
+-- (e.g. OFF/ON, CLOSED/OPEN) instead of walking the full 0-15 editor.
+-- Preserves any other value labels already set via the advanced editor.
+promptOnOffLabels = function(existingLabels)
+  local zeroDefault = (existingLabels and existingLabels[0]) or ""
+  local fifteenDefault = (existingLabels and existingLabels[15]) or ""
+  local zero, fifteen = promptTwoFields(" Quick Value Text ",
+    "Text for value 0 (e.g. OFF, CLOSED):", zeroDefault,
+    "Text for value 15 (e.g. ON, OPEN):", fifteenDefault)
+  if zero == nil then return nil end
+
+  local labels = {}
+  if existingLabels then for k, v in pairs(existingLabels) do labels[k] = v end end
+  zero = trim(zero)
+  fifteen = trim(fifteen)
+  labels[0] = (zero ~= "") and zero or nil
+  labels[15] = (fifteen ~= "") and fifteen or nil
+  return labels
+end
+
+-- Scrollable color picker showing a real swatch of each palette color
+-- next to its name, plus a "Use Default" option. Returns the chosen
+-- COLOR_PALETTE entry ({name=, value=}), or nil if cancelled (Escape) -
+-- callers should leave the existing color untouched in that case, since
+-- nil here means "no change" rather than "use default."
+colorPickerDialog = function(title, currentValue)
+  suspendRender = true
+  local function run()
+    local boxW = math.max(20, math.min(W - 4, 30))
+    local boxH = math.max(8, math.min(H - 2, #COLOR_PALETTE + 4))
+    local boxX = math.floor((W - boxW) / 2) + 1
+    local boxY = math.max(1, math.floor((H - boxH) / 2) + 1)
+    local innerTop = boxY + 2
+    local innerBottom = boxY + boxH - 2
+    local visibleRows = math.max(1, innerBottom - innerTop + 1)
+
+    local sel = 1
+    if currentValue ~= nil then
+      for i, c in ipairs(COLOR_PALETTE) do
+        if c.value == currentValue then sel = i; break end
+      end
+    end
+    local scroll = 0
+
+    local function ensureVis()
+      if sel <= scroll then scroll = sel - 1
+      elseif sel > scroll + visibleRows then scroll = sel - visibleRows end
+      scroll = clamp(scroll, 0, math.max(0, #COLOR_PALETTE - visibleRows))
+    end
+    ensureVis()
+
+    local function render()
+      drawBox(boxX, boxY, boxW, boxH, title)
+      for row = 0, visibleRows - 1 do
+        local y = innerTop + row
+        local idx = scroll + row + 1
+        term.setCursorPos(boxX + 1, y)
+        if idx <= #COLOR_PALETTE then
+          local c = COLOR_PALETTE[idx]
+          local isSel = idx == sel
+
+          term.setBackgroundColor(colors.gray)
+          term.setTextColor(isSel and colors.yellow or colors.white)
+          term.write(isSel and "> " or "  ")
+
+          if type(c.value) == "number" then
+            term.setBackgroundColor(c.value)
+            term.write("   ")
+          else
+            term.setBackgroundColor(colors.gray)
+            term.setTextColor(isSel and colors.yellow or colors.lightGray)
+            term.write("---")
+          end
+
+          term.setBackgroundColor(colors.gray)
+          term.setTextColor(isSel and colors.yellow or colors.white)
+          local rest = " " .. c.name
+          local maxRest = boxW - 2 - 5 -- marker(2) + swatch(3)
+          if #rest > maxRest then rest = rest:sub(1, maxRest) end
+          term.write(rest .. string.rep(" ", math.max(0, maxRest - #rest)))
+        else
+          term.setBackgroundColor(colors.gray)
+          term.write(string.rep(" ", boxW - 2))
+        end
+      end
+      term.setCursorPos(boxX + 1, boxY + boxH - 1)
+      term.setBackgroundColor(colors.gray)
+      term.setTextColor(colors.lightGray)
+      term.write("[Enter]Pick [Esc]Cancel")
+    end
+    render()
+
+    while true do
+      local ev, a, b, c2 = os.pullEvent()
+      if ev == "key" then
+        if a == keys.up then
+          if sel > 1 then sel = sel - 1; ensureVis(); render() end
+        elseif a == keys.down then
+          if sel < #COLOR_PALETTE then sel = sel + 1; ensureVis(); render() end
+        elseif a == keys.enter then
+          return COLOR_PALETTE[sel]
+        elseif a == keys.escape then
+          return nil
+        end
+      elseif ev == "mouse_click" then
+        local mx, my = b, c2
+        if my >= innerTop and my <= innerBottom then
+          local idx = scroll + (my - innerTop) + 1
+          if COLOR_PALETTE[idx] then return COLOR_PALETTE[idx] end
+        end
+      elseif ev == "mouse_scroll" then
+        sel = clamp(sel + a, 1, #COLOR_PALETTE); ensureVis(); render()
       end
     end
   end
@@ -1895,6 +2092,29 @@ end
 -- ======================================================================
 -- CANVAS BLOCK ACTIONS
 -- ======================================================================
+
+-- Shared color-customization step, offered when editing any block type.
+-- Doesn't touch anything if the user declines or cancels a step.
+promptBlockColors = function(block)
+  local wantsColor = confirmDialog("Customize this block's colors?")
+  refreshAfterDialog()
+  if not wantsColor then return end
+
+  local bgPicked = colorPickerDialog(" Background Color ", block.bgColor)
+  refreshAfterDialog()
+  if bgPicked then
+    block.bgColor = (bgPicked.value == "__default__") and nil or bgPicked.value
+  end
+
+  local fgPicked = colorPickerDialog(" Text Color ", block.fgColor)
+  refreshAfterDialog()
+  if fgPicked then
+    block.fgColor = (fgPicked.value == "__default__") and nil or fgPicked.value
+  end
+
+  dataDirty = true
+end
+
 actionAddBlock = function()
   local blockType = choiceDialog(" Add Block ", "What kind of block do you want to add?", {
     { char = "1", label = "[1] Text - a movable label", value = BLOCK_TEXT },
@@ -1904,7 +2124,7 @@ actionAddBlock = function()
   refreshAfterDialog()
   if blockType == nil then return end
 
-  local block = { type = blockType, text = "", label = "", linkId = nil, memberKey = nil, labels = {} }
+  local block = { type = blockType, text = "", label = "", linkId = nil, memberKey = nil, labels = {}, bgColor = nil, fgColor = nil }
 
   if blockType == BLOCK_TEXT then
     local text = promptSingleField(" New Text Block ", "Text:", "Label")
@@ -1952,43 +2172,56 @@ actionEditBlock = function(idx)
   if block.type == BLOCK_TEXT then
     local newText = promptSingleField(" Edit Text Block ", "Text:", block.text or "")
     refreshAfterDialog()
-    if newText == nil then return end
+    if newText == nil then return end -- cancelled the only field: abort the whole edit
     block.text = newText
     dataDirty = true
-    setStatus("Text block updated.", colors.lime)
-    return
-  end
-
-  local candidates = buildCandidates(block.type)
-  if #candidates == 0 then
-    setStatus("No suitable links exist to bind to.", colors.orange)
-    return
-  end
-  local currentPick = 1
-  for i, cand in ipairs(candidates) do
-    if cand.linkId == block.linkId and cand.memberKey == block.memberKey then currentPick = i; break end
-  end
-  local picked = pickLinkDialog(block.type == BLOCK_OUTPUT and " Bind Output To " or " Bind Input To ", candidates, currentPick)
-  refreshAfterDialog()
-  if picked then
-    block.linkId = picked.linkId
-    block.memberKey = picked.memberKey
-  end
-
-  local newLabel = promptSingleField(" Block Label ", "Custom label (blank = use link name):", block.label or "")
-  refreshAfterDialog()
-  if newLabel ~= nil then block.label = trim(newLabel) end
-
-  if block.type == BLOCK_OUTPUT then
-    local wantsLabels = confirmDialog("Set custom text for specific output values?")
-    refreshAfterDialog()
-    if wantsLabels then
-      block.labels = labelsEditorDialog(block.labels or {})
-      refreshAfterDialog()
+  else
+    local candidates = buildCandidates(block.type)
+    if #candidates == 0 then
+      setStatus("No suitable links exist to bind to.", colors.orange)
+      return
     end
+    local currentPick = 1
+    for i, cand in ipairs(candidates) do
+      if cand.linkId == block.linkId and cand.memberKey == block.memberKey then currentPick = i; break end
+    end
+    local picked = pickLinkDialog(block.type == BLOCK_OUTPUT and " Bind Output To " or " Bind Input To ", candidates, currentPick)
+    refreshAfterDialog()
+    if picked then
+      block.linkId = picked.linkId
+      block.memberKey = picked.memberKey
+    end
+
+    local newLabel = promptSingleField(" Block Label ", "Custom label (blank = use link name):", block.label or "")
+    refreshAfterDialog()
+    if newLabel ~= nil then block.label = trim(newLabel) end
+
+    local wantsValueText = confirmDialog("Customize the displayed value text (e.g. ON/OFF)?")
+    refreshAfterDialog()
+    if wantsValueText then
+      local textMode = choiceDialog(" Value Text ", "How do you want to customize it?", {
+        { char = "1", label = "[1] Quick: label 0 and 15 (e.g. ON/OFF)", value = "quick" },
+        { char = "2", label = "[2] Advanced: label each value 0-15", value = "advanced" },
+        { char = "3", label = "[3] Clear - show the raw number", value = "clear" },
+      })
+      refreshAfterDialog()
+      if textMode == "quick" then
+        local newLabels = promptOnOffLabels(block.labels)
+        refreshAfterDialog()
+        if newLabels then block.labels = newLabels end
+      elseif textMode == "advanced" then
+        block.labels = labelsEditorDialog(block.labels or {})
+        refreshAfterDialog()
+      elseif textMode == "clear" then
+        block.labels = {}
+      end
+    end
+
+    dataDirty = true
   end
 
-  dataDirty = true
+  promptBlockColors(block)
+  refreshAfterDialog()
   setStatus("Block updated.", colors.lime)
 end
 
